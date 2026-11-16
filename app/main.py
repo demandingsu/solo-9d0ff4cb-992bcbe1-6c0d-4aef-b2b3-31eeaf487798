@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from .csv_import import CSVParseError, parse_samples_csv
-from .db import ConflictError, Database, ImportError_
+from .db import ConflictError, Database, ImportError_, UnknownCellError
 
 DB_PATH = os.environ.get("BATTERY_DB_PATH", "/data/battery.db")
 
@@ -47,6 +47,32 @@ class UploadOut(BaseModel):
     duplicate: int
     version: int
     total_cycles: int
+
+
+class CrossCheckSegmentOut(BaseModel):
+    offset: int
+    a_start_ts: int
+    a_end_ts: int
+    b_start_ts: int
+    b_end_ts: int
+    pair_count: int
+    nonzero_pairs: int
+    ambiguous: bool
+    alternative_offsets: list[int]
+    a_cycle_nos: list[int]
+    b_cycle_nos: list[int]
+
+
+class CrossCheckOut(BaseModel):
+    cell_a: str
+    cell_b: str
+    offset_convention: str
+    min_offset: int
+    max_offset: int
+    cell_a_version: int
+    cell_b_version: int
+    segment_count: int
+    segments: list[CrossCheckSegmentOut]
 
 
 @app.post(
@@ -91,6 +117,45 @@ def get_report(cell_id: str):
     if report is None:
         raise HTTPException(status_code=404, detail=f"unknown cell {cell_id}")
     return report
+
+
+@app.get(
+    "/cells/{cell_a}/cross-check/{cell_b}",
+    response_model=CrossCheckOut,
+    tags=["cross-check"],
+    summary=(
+        "Find maximal fixed-offset stretches with pointwise identical current"
+        " between two cells"
+    ),
+)
+def cross_check(
+    cell_a: str,
+    cell_b: str,
+    min_offset: int = Query(
+        -60, ge=-120, le=120, description="B clock minus A clock, seconds (inclusive)"
+    ),
+    max_offset: int = Query(
+        60, ge=-120, le=120, description="B clock minus A clock, seconds (inclusive)"
+    ),
+):
+    if cell_a == cell_b:
+        raise HTTPException(
+            status_code=400, detail="cell_a and cell_b must be different cells"
+        )
+    if min_offset > max_offset:
+        raise HTTPException(
+            status_code=422,
+            detail="min_offset must not be greater than max_offset",
+        )
+    if max_offset - min_offset > 120:
+        raise HTTPException(
+            status_code=422,
+            detail="offset range width must not exceed 120 seconds",
+        )
+    try:
+        return db.cross_check(cell_a, cell_b, min_offset, max_offset)
+    except UnknownCellError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/health", tags=["ops"], summary="Liveness probe")

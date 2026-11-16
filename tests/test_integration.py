@@ -249,7 +249,9 @@ class ConcurrencyTests(unittest.TestCase):
         # every committed version must be internally consistent
         import sqlite3
 
-        conn = sqlite3.connect(os.environ["BATTERY_DB_PATH"])
+        from app.main import db as live_db
+
+        conn = sqlite3.connect(live_db.db_path)
         rows = conn.execute(
             "SELECT v.version, v.total_cycles, COUNT(c.cycle_no) FROM"
             " report_versions v LEFT JOIN cycles c"
@@ -292,7 +294,9 @@ class ConcurrencyTests(unittest.TestCase):
         # stored value at ts=10 must be the original 1.0 A
         import sqlite3
 
-        conn = sqlite3.connect(os.environ["BATTERY_DB_PATH"])
+        from app.main import db as live_db
+
+        conn = sqlite3.connect(live_db.db_path)
         val = conn.execute(
             "SELECT current_ma FROM samples WHERE cell_id=? AND ts=10", (cell,)
         ).fetchone()[0]

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .algorithm import Cycle, detect_cycles
+from .crosscheck import find_matching_segments
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cells (
@@ -66,6 +67,14 @@ class ConflictError(Exception):
 
 class ImportError_(Exception):
     """Generic import failure (bad CSV payload etc.)."""
+
+
+class UnknownCellError(Exception):
+    """A cross-check referenced a cell that has never been imported."""
+
+    def __init__(self, cell_id: str):
+        self.cell_id = cell_id
+        super().__init__(f"unknown cell {cell_id}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -289,6 +298,117 @@ class Database:
                 " ORDER BY c.cell_id"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Cross-cell cross-check
+    # ------------------------------------------------------------------ #
+    def cross_check(
+        self, cell_a: str, cell_b: str, min_offset: int, max_offset: int
+    ) -> dict:
+        """Find fixed-offset same-current stretches between two cells.
+
+        Both cells' samples, the report versions used for cycle mapping and
+        the cycle numbers are read inside one snapshot transaction, so the
+        answer always describes a single committed state for both cells. A
+        failed (rolled-back) upload never commits anything, hence cannot
+        change this result.
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            try:
+                known = {
+                    r["cell_id"]
+                    for r in conn.execute(
+                        "SELECT cell_id FROM cells WHERE cell_id IN (?,?)",
+                        (cell_a, cell_b),
+                    ).fetchall()
+                }
+                missing = [c for c in (cell_a, cell_b) if c not in known]
+                if missing:
+                    raise UnknownCellError(missing[0])
+
+                def load(cell_id: str) -> List[Tuple[int, int]]:
+                    return [
+                        (r["ts"], r["current_ma"])
+                        for r in conn.execute(
+                            "SELECT ts, current_ma FROM samples"
+                            " WHERE cell_id=? ORDER BY ts ASC",
+                            (cell_id,),
+                        ).fetchall()
+                    ]
+
+                samples_a = load(cell_a)
+                samples_b = load(cell_b)
+
+                def latest_cycles(cell_id: str) -> Tuple[int, List[dict]]:
+                    ver = conn.execute(
+                        "SELECT version FROM report_versions WHERE cell_id=?"
+                        " ORDER BY version DESC LIMIT 1",
+                        (cell_id,),
+                    ).fetchone()
+                    if ver is None:
+                        return 0, []
+                    rows = conn.execute(
+                        "SELECT cycle_no, started_at, ended_at FROM cycles"
+                        " WHERE cell_id=? AND version=? ORDER BY cycle_no ASC",
+                        (cell_id, ver["version"]),
+                    ).fetchall()
+                    return ver["version"], [dict(r) for r in rows]
+
+                version_a, cycles_a = latest_cycles(cell_a)
+                version_b, cycles_b = latest_cycles(cell_b)
+
+                segments = find_matching_segments(
+                    samples_a, samples_b, min_offset, max_offset
+                )
+                for seg in segments:
+                    seg.a_cycle_nos = _intersecting_cycles(
+                        cycles_a, seg.a_start_ts, seg.a_end_ts
+                    )
+                    seg.b_cycle_nos = _intersecting_cycles(
+                        cycles_b, seg.b_start_ts, seg.b_end_ts
+                    )
+
+                return {
+                    "cell_a": cell_a,
+                    "cell_b": cell_b,
+                    "offset_convention": "b_ts = a_ts + offset (offset = B clock - A clock, seconds)",
+                    "min_offset": min_offset,
+                    "max_offset": max_offset,
+                    "cell_a_version": version_a,
+                    "cell_b_version": version_b,
+                    "segment_count": len(segments),
+                    "segments": [
+                        {
+                            "offset": s.offset,
+                            "a_start_ts": s.a_start_ts,
+                            "a_end_ts": s.a_end_ts,
+                            "b_start_ts": s.b_start_ts,
+                            "b_end_ts": s.b_end_ts,
+                            "pair_count": s.pair_count,
+                            "nonzero_pairs": s.nonzero_pairs,
+                            "ambiguous": s.ambiguous,
+                            "alternative_offsets": s.alternative_offsets,
+                            "a_cycle_nos": s.a_cycle_nos,
+                            "b_cycle_nos": s.b_cycle_nos,
+                        }
+                        for s in segments
+                    ],
+                }
+            finally:
+                conn.execute("COMMIT")
+
+
+def _intersecting_cycles(
+    cycles: Sequence[dict], start_ts: int, end_ts: int
+) -> List[int]:
+    """Cycle numbers of the latest report whose [started_at, ended_at]
+    interval overlaps [start_ts, end_ts] (closed intervals)."""
+    return [
+        c["cycle_no"]
+        for c in cycles
+        if c["started_at"] <= end_ts and c["ended_at"] >= start_ts
+    ]
 
 
 def _to_storage(current_a: float) -> int:

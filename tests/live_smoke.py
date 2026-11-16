@@ -115,6 +115,49 @@ def main():
         cells = c.get(f"{BASE}/cells").json()
         check(any(x["cell_id"] == cell for x in cells), "cell list endpoint")
 
+        # --- 5. cross-cell cross-check ("串档") -------------------------
+        ca = "LIVE-XC-A"
+        cb = "LIVE-XC-B"
+        two_cycles = [
+            (0, 0), (10, 2), (20, 0), (30, -3), (40, 0),
+            (50, 2), (60, 0), (70, -3), (80, 0),
+        ]
+        upload(c, ca, two_cycles)
+        upload(c, cb, [(ts + 30, cur) for ts, cur in two_cycles])
+        r = c.get(f"{BASE}/cells/{ca}/cross-check/{cb}",
+                  params={"min_offset": -60, "max_offset": 60})
+        check(r.status_code == 200, "cross-check endpoint")
+        body = r.json()
+        check(body["segment_count"] == 1, "one maximal matching segment found")
+        seg = body["segments"][0]
+        check(seg["offset"] == 30, "fixed clock offset recovered")
+        check(seg["pair_count"] == 9 and seg["nonzero_pairs"] == 4,
+              "pair counts (9 total, 4 non-zero)")
+        check(seg["a_cycle_nos"] == [1, 2] and seg["b_cycle_nos"] == [1, 2],
+              "intersecting cycle numbers on both sides")
+        check(not seg["ambiguous"], "unique offset is not ambiguous")
+
+        # window that cannot contain the +30 s offset
+        r = c.get(f"{BASE}/cells/{ca}/cross-check/{cb}",
+                  params={"min_offset": -60, "max_offset": 29})
+        check(r.json()["segments"] == [], "offset outside window -> no segment")
+
+        # rejected upload must not move the committed state the check reads
+        before = c.get(f"{BASE}/cells/{ca}/cross-check/{cb}").json()
+        bad = upload(c, cb, [(40, 9.9)])  # B already has +2 A at t=40
+        check(bad.status_code == 409, "conflicting cross-check batch rejected")
+        after = c.get(f"{BASE}/cells/{ca}/cross-check/{cb}").json()
+        check(after["cell_b_version"] == before["cell_b_version"],
+              "failed upload leaves cross-check state untouched")
+
+        # validation + 404 behaviour
+        check(c.get(f"{BASE}/cells/{ca}/cross-check/{cb}",
+                    params={"min_offset": 10, "max_offset": 0}).status_code == 422,
+              "inverted offset window rejected")
+        check(c.get(f"{BASE}/cells/{ca}/cross-check/NOPE",
+                    params={"min_offset": -60, "max_offset": 60}).status_code == 404,
+              "unknown cell -> 404")
+
     print("\nALL LIVE CHECKS PASSED")
 
 
